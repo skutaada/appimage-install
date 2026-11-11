@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Install an AppImage: move it to ~/Applications and add a start-menu entry."""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOME = Path.home()
+APP_DIR = HOME / "Applications"
+DESKTOP_DIR = HOME / ".local/share/applications"
+ICON_DIR = HOME / ".local/share/icons"
+
+
+def guess_name(filename):
+    name = re.sub(r"\.appimage$", "", filename, flags=re.I)
+    name = re.sub(r"[-_.]?(x86_64|amd64|aarch64|arm64).*$", "", name, flags=re.I)
+    name = re.sub(r"[-_]v?\d[\d.]*.*$", "", name)
+    return name
+
+
+def extract_icon(appimage, app_id):
+    """Pull .DirIcon out of the AppImage. Returns icon path or a generic icon name."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def extract(path):
+            subprocess.run([str(appimage), "--appimage-extract", path], cwd=tmp,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        try:
+            extract(".DirIcon")
+            icon = Path(tmp, "squashfs-root/.DirIcon")
+            if icon.is_symlink():  # .DirIcon is often a symlink; extract its target too
+                extract(os.readlink(icon))
+            if icon.is_file() and icon.stat().st_size > 0:
+                ext = "svg" if b"<svg" in icon.read_bytes()[:512] else "png"
+                dest = ICON_DIR / f"appimage-{app_id}.{ext}"
+                shutil.copyfile(icon, dest)
+                return str(dest)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "application-x-executable"
+
+
+def install(src, name=None):
+    src = Path(src)
+    name = name or guess_name(src.name)
+    app_id = name.replace(" ", "-")
+    dest = APP_DIR / f"{app_id}.AppImage"
+
+    for d in (APP_DIR, DESKTOP_DIR, ICON_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), dest)
+    dest.chmod(0o755)
+
+    icon = extract_icon(dest, app_id)
+    (DESKTOP_DIR / f"appimage-{app_id}.desktop").write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={name}\n"
+        f'Exec="{dest}" %U\n'
+        f"Icon={icon}\n"
+        "Terminal=false\n"
+        "Categories=Utility;\n"
+    )
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", str(DESKTOP_DIR)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"Installed '{name}' -> {dest}")
+
+
+def remove(name):
+    app_id = name.replace(" ", "-")
+    files = [APP_DIR / f"{app_id}.AppImage", DESKTOP_DIR / f"appimage-{app_id}.desktop",
+             *ICON_DIR.glob(f"appimage-{app_id}.*")]
+    for f in files:
+        if f.exists():
+            f.unlink()
+            print(f"removed {f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="examples:\n"
+               "  %(prog)s ~/Downloads/Obsidian-1.5.3-x86_64.AppImage\n"
+               "  %(prog)s some-file.AppImage \"My Cool App\"\n"
+               "  %(prog)s --remove Obsidian",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("appimage", nargs="?", type=Path,
+                        help="path to the .AppImage file to install")
+    parser.add_argument("name", nargs="?",
+                        help="name shown in the start menu (default: guessed from the filename)")
+    parser.add_argument("-r", "--remove", metavar="NAME",
+                        help="uninstall a previously installed AppImage by name")
+    args = parser.parse_args()
+
+    if args.remove:
+        if args.appimage:
+            parser.error("--remove cannot be combined with an AppImage path")
+        remove(args.remove)
+    elif args.appimage:
+        if not args.appimage.is_file():
+            parser.error(f"file not found: {args.appimage}")
+        install(args.appimage, args.name)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
